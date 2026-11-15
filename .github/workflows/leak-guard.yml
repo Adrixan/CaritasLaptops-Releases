@@ -1,0 +1,29 @@
+name: Leak guard
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Credential patterns (no denylist in public CI)
+        run: bash tools/leak-guard.sh --patterns-only src version.json README.md
+
+      - name: gitleaks over the full history
+        # Pinned image: 24 h supply-chain cooldown; bump to the newest release older than 24 h.
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/repo \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git /repo --no-banner --redact --exit-code 1 -v

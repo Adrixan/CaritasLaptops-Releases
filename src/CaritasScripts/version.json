@@ -1,0 +1,7 @@
+{
+  "version": "1.2.0",
+  "releaseDate": "2026-11-15",
+  "minPowerShellVersion": "5.1",
+  "updateManifestUrl": "https://raw.githubusercontent.com/Adrixan/CaritasLaptops-Releases/main/version.json",
+  "releaseUrl": "https://github.com/Adrixan/CaritasLaptops-Releases/releases/latest"
+}

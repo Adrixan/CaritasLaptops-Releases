@@ -1,0 +1,421 @@
+﻿#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Caritas Laptop Control Center - Interactive Terminal User Interface (TUI).
+.DESCRIPTION
+    Central administrative management console for Caritas laptops:
+    - Provides single-key interactive menu for all operational maintenance routines.
+    - Includes automated 1-click initial onboarding for newly donated laptops.
+    - Checks for script updates from GitHub with fast-fail offline timeouts.
+    - Allows seamless switching between Terminal (TUI) and Graphical (GUI) modes.
+    - Automatically requests UAC elevation if launched without administrative tokens.
+.NOTES
+    Compatible with all Windows 11 editions (Home, Pro, Enterprise, Education).
+    Logs operations to logs\ControlCenter.log.
+#>
+[CmdletBinding()]
+param(
+    [switch]$CheckUpdateOnly,
+    [switch]$RunOnboardingUnattended,
+    [string]$OfficeProductKey = ""
+)
+
+# Enforce UTF-8 console and pipeline encoding
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+# 1. Enforce Elevated Privileges
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $elevateArgs = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    if ($CheckUpdateOnly) { $elevateArgs += '-CheckUpdateOnly' }
+    if ($RunOnboardingUnattended) { $elevateArgs += '-RunOnboardingUnattended' }
+    if ($OfficeProductKey) { $elevateArgs += @('-OfficeProductKey', $OfficeProductKey) }
+    Start-Process powershell.exe -Verb RunAs -ArgumentList $elevateArgs
+    exit
+}
+
+# 2. Environment & Directories (Dynamically Resolved)
+$ErrorActionPreference = "Continue"
+
+$scriptDir = $PSScriptRoot
+if (-not $scriptDir) { $scriptDir = (Get-Item -Path ".").FullName }
+
+$baseDir = Split-Path -Path $scriptDir -Parent
+if (-not (Test-Path "$baseDir\scripts")) {
+    $baseDir = $scriptDir
+}
+
+$configDir = Join-Path $baseDir "config"
+$logDir = Join-Path $baseDir "logs"
+$stagingDir = Join-Path $env:TEMP "CaritasStaging"
+
+foreach ($dir in @($scriptDir, $configDir, $logDir)) {
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+}
+
+$localVersionFile = Join-Path $baseDir "version.json"
+if (-not (Test-Path $localVersionFile)) {
+    $localVersionFile = Join-Path $configDir "version.json"
+}
+$logFile = Join-Path $logDir "ControlCenter.log"
+
+try {
+    $Host.UI.RawUI.WindowTitle = "Caritas Laptop Control Center - $env:COMPUTERNAME"
+} catch {}
+
+function Write-CCLog {
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $line = "[$ts] [$Level] $Message"
+    Add-Content -Path $logFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+# Gemeinsame Module: Zugangsdaten-Speicher und Selbst-Aktualisierer
+. (Join-Path $scriptDir "Caritas-Credentials.ps1")
+. (Join-Path $scriptDir "Caritas-Update.ps1")
+
+function Get-LocalVersion {
+    if (Test-Path $localVersionFile) {
+        try {
+            $v = Get-Content $localVersionFile -Raw | ConvertFrom-Json
+            return $v.version
+        } catch {}
+    }
+    return "1.2.0"
+}
+
+# 2. Fast-Fail Self-Update Check (öffentliches Release-Repository, SHA-256-geprüft)
+function Check-ForUpdates {
+    param([switch]$Interactive)
+    $localVer = Get-LocalVersion
+
+    if ($Interactive) {
+        Write-Host "Prüfe auf Skript-Aktualisierungen..." -ForegroundColor Cyan
+    }
+
+    try {
+        $remoteMeta = Get-CaritasUpdateManifest
+
+        if (Test-IsNewerVersion -LocalVersion $localVer -RemoteVersion $remoteMeta.version) {
+            Write-Host "`n[UPDATE VERFÜGBAR] Version $($remoteMeta.version) ist verfügbar (Lokal: $localVer)!" -ForegroundColor Yellow
+            Write-CCLog "Update available: local=$localVer, remote=$($remoteMeta.version)"
+            if ($Interactive) {
+                $ans = Read-Host "Möchten Sie die Skripte jetzt automatisch aktualisieren? (J/N)"
+                if ($ans -eq "J" -or $ans -eq "j" -or $ans -eq "Y" -or $ans -eq "y") {
+                    Invoke-SelfUpdate -Manifest $remoteMeta
+                }
+            }
+            return $true
+        } else {
+            if ($Interactive) {
+                Write-Host "[OK] Alle Skripte sind auf dem neuesten Stand (Version $localVer)." -ForegroundColor Green
+            }
+            return $false
+        }
+    } catch {
+        if ($Interactive) {
+            Write-Host "Hinweis: Update-Server nicht erreichbar oder Gerät ist offline." -ForegroundColor DarkGray
+        }
+        Write-CCLog "Update check skipped/failed: $_" "WARN"
+        return $false
+    }
+}
+
+function Invoke-SelfUpdate {
+    param([Parameter(Mandatory)]$Manifest)
+    Write-Host "Lade Aktualisierungspaket herunter und prüfe die SHA-256-Prüfsumme..." -ForegroundColor Cyan
+    try {
+        $newVer = Install-CaritasUpdate -Manifest $Manifest -ScriptDir $scriptDir -LocalVersionFile $localVersionFile -StagingDir $stagingDir
+        Write-Host "[ERFOLG] Skripte erfolgreich auf Version $newVer aktualisiert!" -ForegroundColor Green
+        Write-CCLog "Self-update successful to version $newVer"
+        Start-Sleep -Seconds 2
+    } catch {
+        Write-Host "Fehler beim Aktualisieren: $_" -ForegroundColor Red
+        Write-CCLog "Self-update failed: $_" "ERROR"
+    }
+}
+
+# 2b. Zugangsdaten (lokal, geschützt; nie in der verteilten Skriptsammlung)
+function Get-CredentialStatusText {
+    param([string]$Name)
+    if (Test-CaritasCredentialStored -Name $Name) { return "hinterlegt" }
+    if (Get-CaritasCredential -Name $Name) { return "aus Autologon übernommen (noch nicht hinterlegt)" }
+    return "FEHLT"
+}
+
+function Invoke-CredentialSetup {
+    param([switch]$OnlyMissing)
+    foreach ($name in @("AdminPassword", "UserPassword")) {
+        $label = Get-CaritasCredentialLabel -Name $name
+        $stored = Test-CaritasCredentialStored -Name $name
+        if ($OnlyMissing -and $stored) { continue }
+        Write-Host ""
+        Write-Host "$label : $(Get-CredentialStatusText -Name $name)" -ForegroundColor Cyan
+        if ($stored) {
+            $ans = Read-Host "Neu festlegen? (J/N)"
+            if ($ans -ne "J" -and $ans -ne "j" -and $ans -ne "Y" -and $ans -ne "y") { continue }
+        }
+        $value = Read-CaritasCredentialFromConsole -Name $name
+        if ($value) {
+            try {
+                Set-CaritasCredential -Name $name -Value $value
+                Write-Host "  [OK] $label geschützt hinterlegt." -ForegroundColor Green
+                Write-CCLog "Credential stored: $name"
+            } catch {
+                Write-Host "  [-] Speichern fehlgeschlagen: $_" -ForegroundColor Red
+                Write-CCLog "Credential store failed for ${name}: $_" "ERROR"
+            }
+        } else {
+            Write-Host "  Keine Änderung." -ForegroundColor Gray
+        }
+    }
+}
+
+# 3. Master Onboarding Orchestration (All-in-One for New Laptops)
+function Invoke-MasterOnboarding {
+    param([switch]$Unattended)
+    Clear-Host
+    Write-Host "==============================================================" -ForegroundColor Cyan
+    Write-Host "   CARITAS LAPTOP ERST-EINRICHTUNG (ALL-IN-ONE SETUP)         " -ForegroundColor Green
+    Write-Host "==============================================================" -ForegroundColor Cyan
+    Write-Host "Dieses Verfahren richtet ein neu gespendetes Gerät vollständig ein:"
+    Write-Host "- Phase 1: Administrator-Absicherung (CaritasAdmin & Administrator aktivieren)"
+    Write-Host "- Phase 2: Software-Synchronisation, Bereinigung & Windows Updates"
+    Write-Host "- Phase 3: Sicherheits-, Energie- & Hardening-Richtlinien"
+    Write-Host "- Phase 4: Standard-Programme (Firefox, VLC, Office) & uBlock"
+    Write-Host "- Phase 5: Browser-Datenschutz, USB-Sperre & Speicher-Wartung"
+    Write-Host "- Phase 6: Benutzerkonto 'User' & Sitzungs-Reset einrichten"
+    Write-Host "==============================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    $activeOfficeKey = $OfficeProductKey
+    if (-not $Unattended) {
+        $confirm = Read-Host "Möchten Sie die Erst-Einrichtung jetzt starten? (J/N)"
+        if ($confirm -ne "J" -and $confirm -ne "j" -and $confirm -ne "Y" -and $confirm -ne "y") {
+            Write-Host "Abgebrochen." -ForegroundColor Gray
+            Start-Sleep -Seconds 1
+            return
+        }
+        $officeInput = Read-Host "Optional: Microsoft Office Lizenzschlüssel eingeben (Enter zum Überspringen)"
+        if ($officeInput -and $officeInput.Trim()) {
+            $activeOfficeKey = ($officeInput -replace '[\s-]', '').Trim().ToUpper()
+        }
+    }
+
+    if (-not $Unattended) {
+        Invoke-CredentialSetup -OnlyMissing
+    }
+    foreach ($credName in @("AdminPassword", "UserPassword")) {
+        if (-not (Get-CaritasCredential -Name $credName)) {
+            Write-Host "[WARNUNG] $(Get-CaritasCredentialLabel -Name $credName) ist nicht hinterlegt: kennwortabhängige Schritte werden übersprungen (Menü [Z])." -ForegroundColor Yellow
+            Write-CCLog "Onboarding without stored credential: $credName" "WARN"
+        }
+    }
+
+    $startTime = Get-Date
+    Write-CCLog "Starting Master Onboarding routine"
+
+    Write-Host "`n[Schritt 1/6] Sichere Administrator-Zugang (CaritasAdmin & Administrator)..." -ForegroundColor Yellow
+    & "$scriptDir\Ensure-CaritasAdminAccounts.ps1"
+
+    Write-Host "`n[Schritt 2/6] Synchronisiere Software & installiere Updates..." -ForegroundColor Yellow
+    & "$scriptDir\Sync-CaritasSoftware.ps1" -OfficeProductKey $activeOfficeKey
+
+    Write-Host "`n[Schritt 3/6] Wende System-Hardening & Energie-Richtlinien an..." -ForegroundColor Yellow
+    & "$scriptDir\Configure-CaritasHardening.ps1"
+
+    Write-Host "`n[Schritt 4/6] Richte Standard-Programme & Werbeblocker ein..." -ForegroundColor Yellow
+    & "$scriptDir\Configure-CaritasDefaults.ps1" -OfficeProductKey $activeOfficeKey
+
+    Write-Host "`n[Schritt 5/6] Richte Datenschutz, USB-Sperre & Speicher-Wartung ein..." -ForegroundColor Yellow
+    & "$scriptDir\Configure-CaritasMaintenanceAndPrivacy.ps1"
+
+    Write-Host "`n[Schritt 6/6] Richte Benutzerkonto 'User' & Clean Slate Reset ein..." -ForegroundColor Yellow
+    & "$scriptDir\Reset-CaritasUserProfile.ps1" -InstallAll
+
+    $duration = [Math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+    Write-Host "`n==============================================================" -ForegroundColor Green
+    Write-Host "  ERST-EINRICHTUNG ERFOLGREICH ABGESCHLOSSEN! (Dauer: $duration Min.)" -ForegroundColor Green
+    Write-Host "==============================================================" -ForegroundColor Green
+    Write-CCLog "Master Onboarding completed in $duration minutes"
+    if (-not $Unattended) {
+        Read-Host "Drücken Sie die Eingabetaste, um zum Hauptmenü zurückzukehren..."
+    }
+}
+
+function Show-AuditLogs {
+    Clear-Host
+    Write-Host "==============================================================" -ForegroundColor Cyan
+    Write-Host "               CARITAS AUDIT LOG ÜBERSICHT                   " -ForegroundColor Yellow
+    Write-Host "==============================================================" -ForegroundColor Cyan
+    Write-Host "Verfügbare Protokolle in $($logDir):"
+    $logs = Get-ChildItem -Path $logDir -Filter "*.log" -ErrorAction SilentlyContinue
+    if (-not $logs) {
+        Write-Host "Keine Logdateien gefunden." -ForegroundColor Gray
+    } else {
+        $idx = 1
+        foreach ($l in $logs) {
+            $sizeKb = [Math]::Round($l.Length / 1KB, 1)
+            Write-Host "  [$idx] $($l.Name) ($sizeKb KB - Zuletzt geändert: $($l.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))"
+            $idx++
+        }
+        Write-Host "  [0] Zurück zum Hauptmenü"
+        Write-Host ""
+        $choice = Read-Host "Wählen Sie ein Log zum Anzeigen [0-$($logs.Count)]"
+        $num = 0
+        if ([int]::TryParse($choice, [ref]$num) -and $num -ge 1 -and $num -le $logs.Count) {
+            $selected = $logs[$num - 1]
+            Clear-Host
+            Write-Host "=== Inhalt von $($selected.FullName) (Letzte 40 Zeilen) ===" -ForegroundColor Cyan
+            Get-Content $selected.FullName -Tail 40 | Out-Host
+            Write-Host "==============================================================" -ForegroundColor Cyan
+            Read-Host "Drücken Sie die Eingabetaste, um fortzufahren..."
+        }
+    }
+}
+
+# 4. Main Menu Loop
+if ($CheckUpdateOnly) {
+    Check-ForUpdates -Interactive
+    exit
+}
+
+if ($RunOnboardingUnattended) {
+    Invoke-MasterOnboarding -Unattended
+    exit
+}
+
+# Background check for updates quietly on startup
+$updateFound = Check-ForUpdates
+
+while ($true) {
+    Clear-Host
+    $curVer = Get-LocalVersion
+    Write-Host "==============================================================" -ForegroundColor Cyan
+    Write-Host "         CARITAS LAPTOP CONTROL CENTER - v$curVer             " -ForegroundColor Yellow
+    Write-Host "         Host: $env:COMPUTERNAME | Modus: Administrator       " -ForegroundColor Gray
+    if ($updateFound) {
+        Write-Host "         * HINWEIS: Ein Skript-Update ist verfügbar (Menü [9])" -ForegroundColor Red
+    }
+    Write-Host "==============================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  [1] Erst-Einrichtung (Vollständiges Onboarding neuer Geräte)" -ForegroundColor Green
+    Write-Host "  [2] Vollständige Wartung (Software-Retention, Winget, Windows Update)"
+    Write-Host "  [3] Schnelle Software-Wartung (Nur Winget & App-Retention)"
+    Write-Host "  [4] Standard-Programme & Werbeblocker (Firefox, VLC, uBlock)"
+    Write-Host "  [5] Sicherheits- & Energie-Richtlinien (Hardening, kein Standby)"
+    Write-Host "  [6] Wartungs-, Datenschutz- & USB-Sperre (Passwörter, USB-Hygiene)"
+    Write-Host "  [7] Administrator-Konten sicherstellen (CaritasAdmin & Administrator)" -ForegroundColor Cyan
+    Write-Host "  [8] Benutzerkonto 'User' komplett zurücksetzen (Clean Slate)" -ForegroundColor Yellow
+    Write-Host "  [O] Microsoft Office aktivieren (Produktschlüssel manuell eingeben)" -ForegroundColor Cyan
+    Write-Host "  [Z] Zugangsdaten hinterlegen (Administrator- und User-Kennwort)" -ForegroundColor Cyan
+    Write-Host "  [9] Grafische Benutzeroberfläche (GUI) öffnen"
+    Write-Host "  [U] Nach Skript-Updates suchen"
+    Write-Host "  [L] Audit-Logs anzeigen"
+    Write-Host "  [0] Beenden"
+    Write-Host ""
+    Write-Host "==============================================================" -ForegroundColor Cyan
+    $selection = Read-Host "Bitte wählen Sie eine Option [0-9, O, Z, U, L]"
+
+    switch ($selection.ToUpper()) {
+        "1" { Invoke-MasterOnboarding }
+        "2" {
+            Clear-Host
+            Write-Host "Starte vollständige Software- und System-Wartung..." -ForegroundColor Yellow
+            & "$scriptDir\Sync-CaritasSoftware.ps1"
+            Read-Host "`nWartung abgeschlossen. Eingabetaste zum Fortfahren..."
+        }
+        "3" {
+            Clear-Host
+            Write-Host "Starte schnelle Software-Wartung (ohne Windows Update)..." -ForegroundColor Yellow
+            & "$scriptDir\Sync-CaritasSoftware.ps1" -SkipWindowsUpdate
+            Read-Host "`nSoftware-Wartung abgeschlossen. Eingabetaste zum Fortfahren..."
+        }
+        "4" {
+            Clear-Host
+            Write-Host "Richte Standard-Programme und uBlock Origin ein..." -ForegroundColor Yellow
+            & "$scriptDir\Configure-CaritasDefaults.ps1"
+            Read-Host "`nStandard-Programme eingerichtet. Eingabetaste zum Fortfahren..."
+        }
+        "5" {
+            Clear-Host
+            Write-Host "Wende Sicherheits- und Energie-Richtlinien an..." -ForegroundColor Yellow
+            & "$scriptDir\Configure-CaritasHardening.ps1"
+            Read-Host "`nSicherheits-Richtlinien angewendet. Eingabetaste zum Fortfahren..."
+        }
+        "6" {
+            Clear-Host
+            Write-Host "Wende Datenschutz-, USB- und Wartungs-Richtlinien an..." -ForegroundColor Yellow
+            & "$scriptDir\Configure-CaritasMaintenanceAndPrivacy.ps1"
+            Read-Host "`nDatenschutz-Richtlinien angewendet. Eingabetaste zum Fortfahren..."
+        }
+        "7" {
+            Clear-Host
+            Write-Host "Sichere Administrator-Konten (CaritasAdmin & Administrator)..." -ForegroundColor Yellow
+            & "$scriptDir\Ensure-CaritasAdminAccounts.ps1"
+            Read-Host "`nAdministrator-Konten eingerichtet. Eingabetaste zum Fortfahren..."
+        }
+        "8" {
+            Clear-Host
+            Write-Host "Setze Benutzerkonto 'User' auf den Ausgangszustand zurück..." -ForegroundColor Yellow
+            & "$scriptDir\Reset-CaritasUserProfile.ps1" -TargetUsername "User"
+            Read-Host "`nBenutzer zurückgesetzt. Eingabetaste zum Fortfahren..."
+        }
+        "O" {
+            Clear-Host
+            Write-Host "==============================================================" -ForegroundColor Cyan
+            Write-Host "             MICROSOFT OFFICE 2024 AKTIVIERUNG                " -ForegroundColor Yellow
+            Write-Host "==============================================================" -ForegroundColor Cyan
+            $activateScript = "$scriptDir\Activate-CaritasOffice.ps1"
+            if (Test-Path $activateScript) {
+                & "$activateScript" -CheckOnly
+                Write-Host ""
+                $inputKey = Read-Host "Bitte MAK-Volumenlizenzschlüssel eingeben (oder Enter zum Abbrechen)"
+                if ($inputKey -and $inputKey.Trim()) {
+                    & "$activateScript" -OfficeProductKey $inputKey.Trim()
+                } else {
+                    Write-Host "Keine Eingabe vorgenommen. Vorgang beendet." -ForegroundColor Gray
+                }
+            } else {
+                Write-Host "Aktivierungsskript nicht gefunden: $activateScript" -ForegroundColor Red
+            }
+            Read-Host "`nEingabetaste zum Fortfahren..."
+        }
+        "Z" {
+            Clear-Host
+            Write-Host "==============================================================" -ForegroundColor Cyan
+            Write-Host "     ZUGANGSDATEN HINTERLEGEN (lokal, nur für Administratoren)" -ForegroundColor Yellow
+            Write-Host "==============================================================" -ForegroundColor Cyan
+            Write-Host "Die verteilte Skriptsammlung enthält keine Kennwörter. Sie werden hier"
+            Write-Host "einmalig pro Gerät verschlüsselt in %ProgramData%\CaritasCredentials abgelegt."
+            Invoke-CredentialSetup
+            Read-Host "`nEingabetaste zum Fortfahren..."
+        }
+        "9" {
+            $guiScript = "$scriptDir\Caritas-ControlCenter-GUI.ps1"
+            if (Test-Path $guiScript) {
+                Write-Host "Starte grafische Benutzeroberfläche..." -ForegroundColor Cyan
+                Start-Process powershell.exe -ArgumentList @('-Sta', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $guiScript)
+                exit
+            } else {
+                Write-Host "GUI-Skript ($guiScript) nicht gefunden." -ForegroundColor Red
+                Start-Sleep -Seconds 2
+            }
+        }
+        "U" {
+            Check-ForUpdates -Interactive
+            Read-Host "Eingabetaste zum Fortfahren..."
+        }
+        "L" { Show-AuditLogs }
+        "0" {
+            Write-Host "Beenden..." -ForegroundColor Gray
+            exit
+        }
+        Default {
+            Write-Host "Ungültige Auswahl. Bitte wählen Sie 0 bis 9." -ForegroundColor Red
+            Start-Sleep -Seconds 1
+        }
+    }
+}
